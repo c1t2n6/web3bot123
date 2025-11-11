@@ -1,0 +1,15 @@
+[Unit]
+Description=Web3Bot123 Trading Bot
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/web3bot123
+EnvironmentFile=/home/ec2-user/web3bot123/.env
+ExecStart=/home/ec2-user/web3bot123/.venv/bin/python /home/ec2-user/web3bot123/bot_template.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
