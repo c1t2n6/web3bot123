@@ -162,6 +162,185 @@ def get_ticker(pair: str) -> Optional[Dict]:
         return None
 
 
+def get_ohlc_from_horus(pair: str, timeframe: str = '15m', limit: int = 50) -> Optional[list]:
+    """Fetch historical OHLC candlestick data from Horus API
+
+    Args:
+        pair: Trading pair (e.g., 'BTC/USD')
+        timeframe: Candle timeframe '1m', '5m', '15m', '1h', '4h', '1d'
+        limit: Number of candles to fetch (default 50)
+
+    Returns:
+        list: OHLC candles with timestamp, open, high, low, close, volume
+        Returns None if API call fails
+    """
+    horus_pair = pair.replace('/', '-')
+    url = f"{HORUS_BASE_URL}/ohlc"
+
+    headers = {
+        'Authorization': f'Bearer {HORUS_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    params = {
+        'pair': horus_pair,
+        'interval': timeframe,
+        'limit': limit
+    }
+
+    try:
+        logger.debug(f"Fetching OHLC from Horus: {pair} {timeframe}")
+        response = requests.get(url, headers=headers, params=params, timeout=HORUS_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get('success') or data.get('data'):
+            candles_raw = data.get('data', data.get('candles', []))
+            candles = []
+
+            for candle in candles_raw:
+                # Normalize timestamp (some APIs return ms)
+                ts = candle.get('timestamp', 0)
+                if isinstance(ts, (int, float)) and ts > 1000000000000:
+                    ts = int(ts / 1000)
+                candles.append({
+                    'timestamp': int(ts),
+                    'open': float(candle.get('open', 0)),
+                    'high': float(candle.get('high', 0)),
+                    'low': float(candle.get('low', 0)),
+                    'close': float(candle.get('close', 0)),
+                    'volume': float(candle.get('volume', 0))
+                })
+
+            if not candles:
+                logger.warning(f"No candle data returned from Horus for {pair}")
+                return None
+
+            logger.debug(f"Fetched {len(candles)} candles for {pair}")
+            if timeframe not in OHLC_HISTORY:
+                OHLC_HISTORY[timeframe] = {}
+            OHLC_HISTORY[timeframe][pair] = deque(candles, maxlen=CANDLE_HISTORY_SIZE)
+            return candles
+        else:
+            error_msg = data.get('error', data.get('message', 'Unknown error'))
+            logger.error(f"Horus API error for {pair}: {error_msg}")
+            return None
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"Timeout fetching OHLC from Horus for {pair}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error to Horus API: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching OHLC from Horus for {pair}: {e}")
+        return None
+
+
+def get_horus_available_pairs() -> Optional[list]:
+    """Fetch list of available trading pairs from Horus"""
+    url = f"{HORUS_BASE_URL}/pairs"
+    headers = {
+        'Authorization': f'Bearer {HORUS_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        pairs = data.get('data', data.get('pairs', []))
+
+        if pairs:
+            logger.info(f"Fetched {len(pairs)} available pairs from Horus")
+            return pairs
+        else:
+            logger.warning("No pairs returned from Horus")
+            return None
+    except Exception as e:
+        logger.error(f"Error fetching pairs from Horus: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fallbacks and Aggregators
+# ---------------------------------------------------------------------------
+
+def get_ohlc_from_coingecko(pair: str, limit: int) -> Optional[list]:
+    """Fallback: Fetch from CoinGecko if Horus unavailable"""
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+        coin_symbol = pair.split('/')[0]
+        coin_map = {
+            'BTC': 'bitcoin', 'ETH': 'ethereum', 'XRP': 'ripple',
+            'ADA': 'cardano', 'SOL': 'solana', 'DOGE': 'dogecoin',
+            'LTC': 'litecoin', 'BCH': 'bitcoin-cash', 'LINK': 'chainlink',
+            'BNB': 'binancecoin', 'MATIC': 'matic-network', 'ATOM': 'cosmos'
+        }
+
+        coin_id = coin_map.get(coin_symbol, coin_symbol.lower())
+        response = requests.get(
+            url.format(coin_id=coin_id),
+            params={'vs_currency': 'usd', 'days': 7},
+            timeout=10
+        )
+        response.raise_for_status()
+
+        ohlc_array = response.json()
+        candles = []
+        # CoinGecko returns [timestamp, open, high, low, close]
+        for item in ohlc_array[-limit:]:
+            if len(item) >= 5:
+                timestamp, o, h, l, c = item
+                candles.append({
+                    'timestamp': int(timestamp / 1000),
+                    'open': float(o), 'high': float(h), 'low': float(l), 'close': float(c), 'volume': 0
+                })
+        return candles if candles else None
+    except Exception as e:
+        logger.warning(f"CoinGecko fallback failed: {e}")
+        return None
+
+
+def get_historical_ohlc(pair: str, timeframe: str = '15m', limit: int = 50) -> Optional[list]:
+    """Fetch historical OHLC data - PRIMARY: Horus, FALLBACK: CoinGecko"""
+    logger.debug(f"Attempting to fetch {pair} from Horus...")
+    candles_horus = get_ohlc_from_horus(pair, timeframe, limit)
+
+    if candles_horus and len(candles_horus) >= 30:
+        logger.info(f"Successfully fetched {pair} candles from Horus")
+        return candles_horus
+
+    logger.warning(f"Horus unavailable for {pair}, trying CoinGecko fallback...")
+    candles_cg = get_ohlc_from_coingecko(pair, limit)
+
+    if candles_cg:
+        logger.info(f"Successfully fetched {pair} candles from CoinGecko (fallback)")
+        return candles_cg
+
+    logger.error(f"Could not fetch candles for {pair} from any source")
+    return None
+
+
+def get_available_pairs() -> list:
+    """Fetch available trading pairs from Horus or use hardcoded list"""
+    pairs_from_horus = get_horus_available_pairs()
+
+    if pairs_from_horus:
+        global AVAILABLE_PAIRS
+        AVAILABLE_PAIRS = pairs_from_horus
+        return pairs_from_horus
+
+    logger.warning("Horus unavailable, using hardcoded pairs list")
+    AVAILABLE_PAIRS = [
+        'BTC/USD', 'ETH/USD', 'XRP/USD', 'BCH/USD', 'LTC/USD',
+        'BNB/USD', 'EOS/USD', 'TRX/USD', 'ATOM/USD', 'DOGE/USD',
+        'LINK/USD', 'ADA/USD', 'ZRX/USD', 'BAT/USD', 'ETC/USD',
+        'ZEC/USD', 'DASH/USD', 'MATIC/USD'
+    ]
+    return AVAILABLE_PAIRS
+
+
 def get_balance() -> Optional[Dict]:
     """Get account balance (Auth: RCL_TopLevelCheck)"""
     url = f"{BASE_URL}/v3/balance"
@@ -281,6 +460,272 @@ def cancel_order(order_id: Optional[str] = None, pair: Optional[str] = None) -> 
 # ============================================================================
 # Trading Strategy (CUSTOMIZE THIS SECTION)
 # ============================================================================
+
+class TradeStatus(Enum):
+    """Enumeration for trade lifecycle states"""
+    CLOSED = "closed"
+    PENDING_BUY = "pending_buy"
+    OPEN = "open"
+    PENDING_SELL = "pending_sell"
+    STOPPED_OUT = "stopped_out"
+    PROFIT_TAKEN = "profit_taken"
+
+class TechnicalAnalysis:
+    """Implements Craig Percoco's technical analysis framework"""
+
+    @staticmethod
+    def detect_fair_value_gap(candles: list) -> dict:
+        """Detect Fair Value Gaps (FVG)"""
+        if len(candles) < 3:
+            return {'bullish_fvgs': [], 'bearish_fvgs': []}
+
+        bullish_fvgs = []
+        bearish_fvgs = []
+
+        for i in range(len(candles) - 2):
+            c1 = candles[i]
+            c2 = candles[i + 1]
+            c3 = candles[i + 2]
+
+            c1_body_low = min(c1['open'], c1['close'])
+            c1_body_high = max(c1['open'], c1['close'])
+            c3_body_low = min(c3['open'], c3['close'])
+            c3_body_high = max(c3['open'], c3['close'])
+
+            if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and
+                c3['close'] > c3['open'] and c1_body_low > c3_body_high):
+                bullish_fvgs.append({
+                    'start_idx': i,
+                    'gap_high': c1_body_low,
+                    'gap_low': c3_body_high,
+                    'midpoint': (c1_body_low + c3_body_high) / 2,
+                    'timestamp': c3.get('timestamp')
+                })
+
+            elif (c1['close'] < c1['open'] and c2['close'] < c2['open'] and
+                  c3['close'] < c3['open'] and c1_body_high < c3_body_low):
+                bearish_fvgs.append({
+                    'start_idx': i,
+                    'gap_high': c3_body_low,
+                    'gap_low': c1_body_high,
+                    'midpoint': (c3_body_low + c1_body_high) / 2,
+                    'timestamp': c3.get('timestamp')
+                })
+
+        return {'bullish_fvgs': bullish_fvgs, 'bearish_fvgs': bearish_fvgs}
+
+    @staticmethod
+    def detect_change_of_character(candles: list, lookback: int = 10) -> dict:
+        """Detect Change of Character (CHOCH)"""
+        if len(candles) < lookback + 2:
+            return {'bullish_choch': None, 'bearish_choch': None}
+
+        recent = candles[-lookback:]
+        highs = [max(c['open'], c['close']) for c in recent]
+        lows = [min(c['open'], c['close']) for c in recent]
+
+        bullish_choch = None
+        bearish_choch = None
+
+        if len(highs) >= 3 and highs[-1] > max(highs[-3:-1]):
+            bullish_choch = {
+                'level': highs[-1],
+                'index': len(candles) - 1,
+                'type': 'higher_high'
+            }
+
+        if len(lows) >= 3 and lows[-1] < min(lows[-3:-1]):
+            bearish_choch = {
+                'level': lows[-1],
+                'index': len(candles) - 1,
+                'type': 'lower_low'
+            }
+
+        return {'bullish_choch': bullish_choch, 'bearish_choch': bearish_choch}
+
+    @staticmethod
+    def detect_trend_structure(candles: list, lookback: int = 20) -> dict:
+        """Analyze trend structure and support/resistance"""
+        if len(candles) < lookback:
+            return {'trend': None, 'support_levels': [], 'resistance_levels': [], 'current_high': 0, 'current_low': 0}
+
+        recent = candles[-lookback:]
+        lows = [min(c['open'], c['close']) for c in recent]
+        highs = [max(c['open'], c['close']) for c in recent]
+
+        support_levels = []
+        for i in range(1, len(lows) - 1):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                support_levels.append(lows[i])
+
+        resistance_levels = []
+        for i in range(1, len(highs) - 1):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                resistance_levels.append(highs[i])
+
+        trend = None
+        if len(highs) >= 2 and len(lows) >= 2:
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+                trend = 'uptrend'
+            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+                trend = 'downtrend'
+            else:
+                trend = 'range'
+
+        return {
+            'trend': trend,
+            'support_levels': sorted(set(support_levels), reverse=True)[:3],
+            'resistance_levels': sorted(set(resistance_levels), reverse=True)[:3],
+            'current_high': highs[-1],
+            'current_low': lows[-1]
+        }
+
+    @staticmethod
+    def calculate_fibonacci_levels(swing_high: float, swing_low: float, direction: str = 'retracement') -> dict:
+        """Calculate Fibonacci levels"""
+        diff = swing_high - swing_low
+
+        if direction == 'retracement':
+            return {
+                '23.6%': swing_high - (diff * 0.236),
+                '38.2%': swing_high - (diff * 0.382),
+                '50.0%': swing_high - (diff * 0.500),
+                '61.8%': swing_high - (diff * 0.618),
+                '78.6%': swing_high - (diff * 0.786),
+            }
+        else:
+            return {
+                '127.2%': swing_low - (diff * 0.272),
+                '161.8%': swing_low - (diff * 0.618),
+                '261.8%': swing_low - (diff * 1.618),
+            }
+
+    @staticmethod
+    def calculate_atr(candles: list, period: int = 14) -> float:
+        """Calculate Average True Range"""
+        if len(candles) < period:
+            return 0
+
+        tr_values = []
+        for i in range(len(candles) - period, len(candles)):
+            high = candles[i]['high']
+            low = candles[i]['low']
+            prev_close = candles[i-1]['close'] if i > 0 else candles[i]['close']
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr_values.append(tr)
+
+        return sum(tr_values) / len(tr_values) if tr_values else 0
+
+
+class PortfolioManager:
+    """Manages portfolio-level metrics and performance tracking"""
+
+    def __init__(self, initial_capital: float):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.portfolio_value_history = [initial_capital]
+        self.trades_history = []
+        self.returns_history = []
+
+    def get_portfolio_metrics(self) -> dict:
+        """Calculate Sharpe, Sortino, Calmar ratios and portfolio performance"""
+        if len(self.portfolio_value_history) < 2:
+            return {
+                'total_return': 0, 'sharpe_ratio': 0, 'sortino_ratio': 0,
+                'calmar_ratio': 0, 'max_drawdown': 0, 'current_drawdown': 0,
+                'current_value': self.portfolio_value_history[-1], 'risk_adjusted_score': 0
+            }
+
+        returns = []
+        for i in range(1, len(self.portfolio_value_history)):
+            ret = ((self.portfolio_value_history[i] - self.portfolio_value_history[i-1]) /
+                   self.portfolio_value_history[i-1])
+            returns.append(ret)
+
+        returns_array = np.array(returns)
+        mean_return = np.mean(returns_array)
+        std_return = np.std(returns_array)
+
+        sharpe = mean_return / std_return if std_return > 0 else 0
+
+        downside_returns = returns_array[returns_array < 0]
+        downside_std = np.std(downside_returns) if len(downside_returns) > 0 else 0
+        sortino = mean_return / downside_std if downside_std > 0 else 0
+
+        peak = self.portfolio_value_history[0]
+        max_dd = 0
+        current_dd = 0
+
+        for i, value in enumerate(self.portfolio_value_history):
+            if value > peak:
+                peak = value
+            dd = (peak - value) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+            if i == len(self.portfolio_value_history) - 1:
+                current_dd = dd
+
+        annual_return = mean_return * 252
+        calmar = annual_return / max_dd if max_dd > 0 else 0
+
+        total_return = ((self.portfolio_value_history[-1] - self.initial_capital) /
+                        self.initial_capital)
+
+        risk_adjusted_score = (0.4 * sortino) + (0.3 * sharpe) + (0.3 * calmar)
+
+        return {
+            'total_return': total_return, 'sharpe_ratio': sharpe,
+            'sortino_ratio': sortino, 'calmar_ratio': calmar,
+            'max_drawdown': max_dd, 'current_drawdown': current_dd,
+            'current_value': self.portfolio_value_history[-1],
+            'risk_adjusted_score': risk_adjusted_score
+        }
+
+    def get_current_drawdown(self, current_value: float) -> float:
+        """Calculate current drawdown"""
+        peak = max(self.portfolio_value_history) if self.portfolio_value_history else current_value
+        if peak == 0:
+            return 0
+        return max(0, (peak - current_value) / peak)
+
+    def can_open_new_position(self, current_positions_open: int) -> bool:
+        """Check if can open new position"""
+        if current_positions_open >= MAX_OPEN_POSITIONS:
+            logger.warning(f"Max open positions ({MAX_OPEN_POSITIONS}) reached")
+            return False
+
+        current_dd = self.get_current_drawdown(self.current_capital)
+        if current_dd > MAX_PORTFOLIO_DRAWDOWN:
+            logger.warning(f"Portfolio drawdown {current_dd:.2%} exceeds limit")
+            return False
+
+        return True
+
+    def log_trade(self, pair: str, side: str, quantity: float, price: float,
+                  order_id: str, stop_loss: float, target: float):
+        """Log trade execution"""
+        trade = {
+            'timestamp': datetime.now().isoformat(),
+            'pair': pair, 'side': side, 'quantity': quantity, 'price': price,
+            'order_id': order_id, 'stop_loss': stop_loss, 'target': target,
+            'commission': quantity * price * 0.001,
+            'risk_reward_ratio': (target - price) / (price - stop_loss) if price != stop_loss else 0
+        }
+        self.trades_history.append(trade)
+        logger.info(f"Trade logged: {side} {quantity:.4f} {pair} @ {price:.2f}")
+
+    def update_portfolio_value(self, current_prices: dict, open_positions: dict):
+        """Update portfolio value"""
+        total_value = self.current_capital
+
+        for pair, position_data in open_positions.items():
+            if position_data.get('status') == TradeStatus.OPEN.value:
+                position_size = position_data.get('position_size', 0)
+                if position_size > 0 and pair in current_prices:
+                    total_value += position_size * current_prices[pair]
+
+        self.portfolio_value_history.append(total_value)
+        self.current_capital = total_value
+
 
 class TradingStrategy:
     """Base trading strategy class - customize with your logic"""
