@@ -15,14 +15,13 @@ import hmac
 import hashlib
 import time
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 
 # New imports for multi-asset support, utilities and environment loading
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from enum import Enum
-import json
 import os
 from dotenv import load_dotenv
 
@@ -684,8 +683,8 @@ class PortfolioManager:
         """Calculate current drawdown"""
         peak = max(self.portfolio_value_history) if self.portfolio_value_history else current_value
         if peak == 0:
-            return 0
-        return max(0, (peak - current_value) / peak)
+            return 0.0
+        return max(0.0, (peak - current_value) / peak)
 
     def can_open_new_position(self, current_positions_open: int) -> bool:
         """Check if can open new position"""
@@ -858,6 +857,223 @@ class TradingStrategy:
             return str(current_price * 1.005)
 
 
+# ---------------------------------------------------------------------------
+# Strategy Implementations
+# ---------------------------------------------------------------------------
+
+class PercocolStrategy(TradingStrategy):
+    """Implements Craig Percoco's 3-pillar high-probability trading system"""
+
+    def __init__(self):
+        super().__init__()
+        self.name = "Percoco High-Probability Strategy"
+        self.ta = TechnicalAnalysis()
+        self.risk_per_trade = 0.02
+        self.min_rr_ratio = 2.0
+        self.max_position_size = 0.05
+
+    def analyze_setup(self, candles: list, ticker: dict) -> dict:
+        """Analyze trading setup on single coin"""
+
+        fvg_data = self.ta.detect_fair_value_gap(candles)
+        choch_data = self.ta.detect_change_of_character(candles)
+        trend_data = self.ta.detect_trend_structure(candles)
+
+        current_price = ticker.get('Ticker', {}).get('LastPrice', 0)
+
+        bullish_setup = {'valid': False, 'entry_price': None, 'stop_loss': None, 'target': None, 'rr_ratio': 0, 'confidence': 0, 'reason': []}
+
+        if (fvg_data['bullish_fvgs'] and choch_data['bullish_choch'] and trend_data['trend'] in ['uptrend', 'range']):
+            latest_fvg = fvg_data['bullish_fvgs'][-1]
+            atr = self.ta.calculate_atr(candles)
+
+            entry = latest_fvg['midpoint']
+            stop_loss = latest_fvg['gap_low'] - (atr * 0.5)
+            fib_levels = self.ta.calculate_fibonacci_levels(latest_fvg['gap_high'], latest_fvg['gap_low'], 'extension')
+            target = fib_levels.get('161.8%', latest_fvg['gap_high'] * 1.05)
+
+            risk = entry - stop_loss
+            reward = target - entry
+            rr = reward / risk if risk > 0 else 0
+
+            confidence = 70
+            if rr >= self.min_rr_ratio:
+                confidence += 10
+            if trend_data['trend'] == 'uptrend':
+                confidence += 10
+            confidence = min(confidence, 100)
+
+            if rr >= self.min_rr_ratio:
+                bullish_setup['valid'] = True
+                bullish_setup['entry_price'] = entry
+                bullish_setup['stop_loss'] = stop_loss
+                bullish_setup['target'] = target
+                bullish_setup['rr_ratio'] = rr
+                bullish_setup['confidence'] = confidence
+                bullish_setup['reason'] = [f'FVG {entry:.2f}', 'Bullish CHOCH', f'Trend: {trend_data["trend"]}', f'R:R {rr:.2f}:1']
+
+        bearish_setup = {'valid': False, 'entry_price': None, 'stop_loss': None, 'target': None, 'rr_ratio': 0, 'confidence': 0, 'reason': []}
+
+        if (fvg_data['bearish_fvgs'] and choch_data['bearish_choch'] and trend_data['trend'] in ['downtrend', 'range']):
+            latest_fvg = fvg_data['bearish_fvgs'][-1]
+            atr = self.ta.calculate_atr(candles)
+
+            entry = latest_fvg['midpoint']
+            stop_loss = latest_fvg['gap_high'] + (atr * 0.5)
+            fib_levels = self.ta.calculate_fibonacci_levels(latest_fvg['gap_high'], latest_fvg['gap_low'], 'extension')
+            target = fib_levels.get('161.8%', latest_fvg['gap_low'] * 0.95)
+
+            risk = stop_loss - entry
+            reward = entry - target
+            rr = reward / risk if risk > 0 else 0
+
+            confidence = 70
+            if rr >= self.min_rr_ratio:
+                confidence += 10
+            if trend_data['trend'] == 'downtrend':
+                confidence += 10
+            confidence = min(confidence, 100)
+
+            if rr >= self.min_rr_ratio:
+                bearish_setup['valid'] = True
+                bearish_setup['entry_price'] = entry
+                bearish_setup['stop_loss'] = stop_loss
+                bearish_setup['target'] = target
+                bearish_setup['rr_ratio'] = rr
+                bearish_setup['confidence'] = confidence
+                bearish_setup['reason'] = [f'FVG {entry:.2f}', 'Bearish CHOCH', f'Trend: {trend_data["trend"]}', f'R:R {rr:.2f}:1']
+
+        return {'bullish_setup': bullish_setup, 'bearish_setup': bearish_setup, 'current_price': current_price, 'trend': trend_data['trend']}
+
+    def score_setup(self, setup: dict) -> float:
+        """Score setup quality 0-100"""
+        if not setup['valid']:
+            return 0
+        score = setup['confidence']
+        if setup['rr_ratio'] > 3:
+            score += 10
+        elif setup['rr_ratio'] > 2:
+            score += 5
+        return min(score, 100)
+
+    def calculate_position_size(self, entry_price: float, stop_loss: float, account_balance: float) -> float:
+        """Calculate position size"""
+        risk_amount = account_balance * self.risk_per_trade
+        stop_distance = abs(entry_price - stop_loss)
+        if stop_distance == 0:
+            return 0
+        position_size = risk_amount / stop_distance
+        max_size = account_balance / entry_price * self.max_position_size
+        return min(position_size, max_size)
+
+
+class MultiAssetPercocolStrategy(PercocolStrategy):
+    """Scans all coins and selects the best opportunity"""
+
+    def __init__(self, portfolio_manager: PortfolioManager):
+        super().__init__()
+        self.portfolio_manager = portfolio_manager
+        self.pair_analysis_cache = {}
+
+    def scan_all_pairs(self) -> dict:
+        """Scan all available pairs"""
+        opportunities = {}
+        logger.info(f"Starting scan of {len(AVAILABLE_PAIRS)} trading pairs...")
+        scan_start_time = time.time()
+        scanned_count = 0
+        skipped_count = 0
+
+        for pair in AVAILABLE_PAIRS:
+            try:
+                if PORTFOLIO_COINS.get(pair, {}).get('status') == TradeStatus.OPEN.value:
+                    skipped_count += 1
+                    continue
+
+                candles = get_historical_ohlc(pair, PRIMARY_TIMEFRAME, limit=50)
+                if not candles or len(candles) < 30:
+                    skipped_count += 1
+                    continue
+
+                ticker = get_ticker(pair)
+                if not ticker or not ticker.get('Success'):
+                    skipped_count += 1
+                    continue
+
+                scanned_count += 1
+                setup = self.analyze_setup(candles, ticker)
+                bullish_score = self.score_setup(setup['bullish_setup'])
+                bearish_score = self.score_setup(setup['bearish_setup'])
+                best_score = max(bullish_score, bearish_score)
+
+                if best_score > MIN_SETUP_CONFIDENCE:
+                    opportunities[pair] = {
+                        'bullish_score': bullish_score, 'bearish_score': bearish_score,
+                        'best_score': best_score, 'setup': setup,
+                        'direction': 'bullish' if bullish_score > bearish_score else 'bearish'
+                    }
+            except Exception as e:
+                logger.error(f"Error scanning {pair}: {e}")
+                skipped_count += 1
+                continue
+
+        ranked_opportunities = sorted(opportunities.items(), key=lambda x: x[1]['best_score'], reverse=True)
+        scan_duration = time.time() - scan_start_time
+
+        logger.info(f"Scan complete: {scanned_count} scanned, {skipped_count} skipped, {len(ranked_opportunities)} found ({scan_duration:.1f}s)")
+        for i, (pair, opp) in enumerate(ranked_opportunities[:5]):
+            logger.info(f"  #{i+1} {pair}: {opp['best_score']:.0f}% ({opp['direction']})")
+
+        return dict(ranked_opportunities)
+
+    def select_best_opportunity(self, opportunities: dict) -> tuple:
+        """Select best opportunity to trade"""
+        if not opportunities:
+            logger.info("No opportunities found")
+            return None, None
+
+        best_pair = list(opportunities.keys())[0]
+        best_opportunity = opportunities[best_pair]
+        logger.info(f"Selected: {best_pair} (score: {best_opportunity['best_score']:.0f}%)")
+        return best_pair, best_opportunity
+
+    def execute_selected_trade(self, pair: str, opportunity: dict, balance: dict):
+        """Execute selected trade"""
+        direction = opportunity['direction']
+        setup_data = opportunity['setup'][direction + '_setup']
+
+        if not setup_data['valid']:
+            logger.warning(f"Setup invalid for {pair}")
+            return
+
+        available_usd = balance.get('Balance', {}).get('USD', {}).get('Available', 0)
+        position_size = self.calculate_position_size(setup_data['entry_price'], setup_data['stop_loss'], available_usd)
+
+        if position_size < 0.001:
+            logger.warning(f"Position size too small: {position_size}")
+            return
+
+        side = 'BUY' if direction == 'bullish' else 'SELL'
+
+        order = place_order(pair, side, "LIMIT", str(position_size), str(setup_data['entry_price']))
+
+        if order and order.get('Success'):
+            order_id = order.get('OrderDetail', {}).get('OrderID')
+            PORTFOLIO_COINS.setdefault(pair, {})
+            PORTFOLIO_COINS[pair]['position_size'] = position_size
+            PORTFOLIO_COINS[pair]['entry_price'] = setup_data['entry_price']
+            PORTFOLIO_COINS[pair]['stop_loss'] = setup_data['stop_loss']
+            PORTFOLIO_COINS[pair]['target'] = setup_data['target']
+            PORTFOLIO_COINS[pair]['status'] = TradeStatus.PENDING_BUY.value
+            PORTFOLIO_COINS[pair]['entry_time'] = time.time()
+            PORTFOLIO_COINS[pair]['direction'] = direction
+
+            self.portfolio_manager.log_trade(pair, side, position_size, setup_data['entry_price'], order_id, setup_data['stop_loss'], setup_data['target'])
+            logger.info(f"Order placed: {order_id}")
+        else:
+            error = order.get('ErrMsg', 'Unknown error') if order else 'No response'
+            logger.error(f"Failed to execute: {error}")
+
+
 # ============================================================================
 # Trading Bot Main Loop
 # ============================================================================
@@ -1006,19 +1222,173 @@ class TradingBot:
             logger.info(f"Final stats: {self.stats}")
 
 
+# ---------------------------------------------------------------------------
+# Multi-asset trading bot (concrete implementation used by main)
+# ---------------------------------------------------------------------------
+
+class MultiAssetTradingBot(TradingBot):
+    """Main trading bot for multi-asset portfolio"""
+
+    def __init__(self, strategy: MultiAssetPercocolStrategy, portfolio_manager: PortfolioManager):
+        super().__init__(strategy)
+        self.portfolio_manager = portfolio_manager
+        self.scan_interval = SCAN_INTERVAL
+        self.last_scan_time = 0
+        self.position_check_interval = POSITION_CHECK_INTERVAL
+        self.last_position_check = 0
+
+    def initialize(self) -> bool:
+        logger.info("="*60)
+        logger.info("INITIALIZING MULTI-ASSET TRADING BOT")
+        logger.info("="*60)
+
+        if not HORUS_API_KEY:
+            logger.error("HORUS_API_KEY not configured")
+            return False
+
+        pairs = get_available_pairs()
+        if not pairs:
+            logger.error("Failed to fetch available pairs")
+            return False
+
+        global AVAILABLE_PAIRS
+        AVAILABLE_PAIRS = pairs
+        logger.info(f"Loaded {len(AVAILABLE_PAIRS)} available pairs")
+
+        initialize_portfolio_tracking()
+        return True
+
+    def run_iteration(self):
+        current_time = time.time()
+
+        try:
+            if current_time - self.last_scan_time > self.scan_interval:
+                # cast strategy to concrete type for static analysis
+                strategy_var = cast(MultiAssetPercocolStrategy, self.strategy)
+
+                opportunities = strategy_var.scan_all_pairs()
+                open_positions_count = sum(1 for d in PORTFOLIO_COINS.values() if d.get('status') == TradeStatus.OPEN.value)
+
+                if self.portfolio_manager.can_open_new_position(open_positions_count):
+                    pair, opportunity = strategy_var.select_best_opportunity(opportunities)
+                    if pair and opportunity:
+                        balance = get_balance()
+                        if balance and balance.get('Success'):
+                            strategy_var.execute_selected_trade(pair, opportunity, balance)
+
+                self.last_scan_time = current_time
+
+            if current_time - self.last_position_check > self.position_check_interval:
+                self._manage_open_positions()
+                self._update_portfolio_metrics()
+                self.last_position_check = current_time
+
+        except Exception as e:
+            logger.error(f"Error in run_iteration: {e}", exc_info=True)
+
+    def _manage_open_positions(self):
+        current_prices = {}
+        for pair, coin_data in PORTFOLIO_COINS.items():
+            if coin_data.get('status') in [TradeStatus.OPEN.value, TradeStatus.PENDING_BUY.value]:
+                ticker = get_ticker(pair)
+                if ticker and ticker.get('Success'):
+                    current_prices[pair] = ticker.get('Ticker', {}).get('LastPrice', 0)
+
+        for pair, coin_data in PORTFOLIO_COINS.items():
+            status = coin_data.get('status')
+            if status not in [TradeStatus.OPEN.value, TradeStatus.PENDING_BUY.value] or pair not in current_prices:
+                continue
+
+            current_price = current_prices[pair]
+
+            if status == TradeStatus.PENDING_BUY.value:
+                pending = query_order(pair=pair, pending_only=True)
+                if pending and pending.get('Success') and len(pending.get('OrderMatched', [])) > 0:
+                    coin_data['status'] = TradeStatus.OPEN.value
+                    logger.info(f"✓ {pair} filled at {current_price:.2f}")
+
+            stop_loss = coin_data.get('stop_loss')
+            direction = coin_data.get('direction', 'bullish')
+
+            if stop_loss and ((direction == 'bullish' and current_price <= stop_loss) or (direction == 'bearish' and current_price >= stop_loss)):
+                logger.warning(f"⚠ {pair} HIT STOP-LOSS")
+                self._close_position(pair, "STOP_LOSS", current_price)
+                continue
+
+            target = coin_data.get('target')
+            if target and ((direction == 'bullish' and current_price >= target) or (direction == 'bearish' and current_price <= target)):
+                logger.info(f"✓ {pair} HIT TAKE-PROFIT")
+                self._close_position(pair, "TAKE_PROFIT", current_price)
+
+        self.portfolio_manager.update_portfolio_value(current_prices, PORTFOLIO_COINS)
+
+    def _close_position(self, pair: str, reason: str, exit_price: float):
+        coin_data = PORTFOLIO_COINS.get(pair, {})
+        position_size = coin_data.get('position_size', 0)
+        direction = coin_data.get('direction', 'bullish')
+
+        if position_size == 0:
+            return
+
+        side = 'SELL' if direction == 'bullish' else 'BUY'
+        order = place_order(pair, side, "MARKET", str(position_size), None)
+
+        if order and order.get('Success'):
+            pnl = (exit_price - coin_data.get('entry_price', 0)) * position_size * (1 if direction == 'bullish' else -1)
+            coin_data['status'] = TradeStatus.CLOSED.value
+            coin_data['pnl'] = pnl
+            logger.info(f"✓ {pair} closed: PnL=${pnl:,.2f}")
+
+    def _update_portfolio_metrics(self):
+        metrics = self.portfolio_manager.get_portfolio_metrics()
+        logger.info("\n" + "="*60 + "\nMETRICS\n" + "="*60)
+        logger.info(f"Value: ${metrics['current_value']:,.2f} | Return: {metrics['total_return']:+.2%}")
+        logger.info(f"Sharpe: {metrics['sharpe_ratio']:.2f} | Sortino: {metrics['sortino_ratio']:.2f} | Calmar: {metrics['calmar_ratio']:.2f}")
+        logger.info("="*60)
+
+
+# Helper to initialize portfolio tracking
+def initialize_portfolio_tracking():
+    """Initialize portfolio tracking for all coins"""
+    global AVAILABLE_PAIRS, PORTFOLIO_COINS
+    logger.info("Initializing portfolio tracking...")
+
+    for pair in AVAILABLE_PAIRS:
+        PORTFOLIO_COINS[pair] = {
+            'position_size': 0,
+            'entry_price': None,
+            'stop_loss': None,
+            'target': None,
+            'pnl': 0,
+            'status': TradeStatus.CLOSED.value,
+            'entry_time': None,
+            'last_update': None,
+            'direction': None
+        }
+
+    logger.info(f"Initialized {len(PORTFOLIO_COINS)} coins")
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
 
 def main():
     """Main entry point"""
-    # Create strategy instance
-    strategy = TradingStrategy()
-    
-    # Create bot instance
-    bot = TradingBot(strategy)
-    
-    # Run bot
+    logger.info("\n" + "="*60)
+    logger.info("ROOSTOO AI TRADING BOT - CRAIG PERCOCO STRATEGY")
+    logger.info("="*60 + "\n")
+
+    initial_capital = 10000.0
+    portfolio_manager = PortfolioManager(initial_capital)
+    strategy = MultiAssetPercocolStrategy(portfolio_manager)
+    bot = MultiAssetTradingBot(strategy, portfolio_manager)
+
+    if not bot.initialize():
+        logger.error("Initialization failed")
+        return
+
+    logger.info(f"Starting bot loop...\n")
     bot.run()
 
 
