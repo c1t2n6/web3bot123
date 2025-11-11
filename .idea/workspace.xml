@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="5596c278-8245-4edf-9ce0-2099d67319d4" name="Changes" comment="" />
+    <list default="true" id="5596c278-8245-4edf-9ce0-2099d67319d4" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/web3bot123/setup_env.sh" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/web3bot123/web3bot.service" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/web3bot123" beforeDir="false" afterPath="$PROJECT_DIR$/web3bot123" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -52,7 +57,7 @@
       <updated>1762855598822</updated>
       <workItem from="1762855599990" duration="5043000" />
       <workItem from="1762861301819" duration="9380000" />
-      <workItem from="1762878717022" duration="591000" />
+      <workItem from="1762878717022" duration="1339000" />
     </task>
     <servers />
   </component>
