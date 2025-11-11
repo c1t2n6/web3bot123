@@ -17,6 +17,18 @@ import time
 import logging
 from typing import Optional, Dict, Any
 
+# New imports for multi-asset support, utilities and environment loading
+import numpy as np
+from datetime import datetime, timedelta
+from collections import deque
+from enum import Enum
+import json
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -30,6 +42,43 @@ SECRET_KEY = "your-secret-key-here"
 # Trading configuration
 TRADING_PAIR = "BTC/USD"  # Change to your preferred pair
 CHECK_INTERVAL = 60  # seconds between strategy checks
+
+# ============================================================================
+# MULTI-ASSET PORTFOLIO CONFIGURATION
+# ============================================================================
+AVAILABLE_PAIRS = []
+PORTFOLIO_COINS = {}
+
+CANDLE_HISTORY_SIZE = 100
+OHLC_HISTORY = {}
+
+PRIMARY_TIMEFRAME = '15m'
+CONFIRMATION_TIMEFRAME = '1h'
+ALTERNATIVE_TIMEFRAMES = ['5m', '4h', '1d']
+
+SCAN_INTERVAL = 300
+POSITION_CHECK_INTERVAL = 60
+
+GLOBAL_PORTFOLIO_RISK = 0.02
+MAX_OPEN_POSITIONS = 1
+MAX_PORTFOLIO_DRAWDOWN = 0.15
+MIN_RR_RATIO = 2.0
+MIN_SETUP_CONFIDENCE = 80
+
+TRADE_LOG_FILE = 'trades.json'
+PORTFOLIO_LOG_FILE = 'portfolio_metrics.json'
+
+HORUS_API_KEY = os.getenv('HORUS_API_KEY')
+HORUS_BASE_URL = "https://api.horusdata.xyz/v1"
+DATA_SOURCE_PRIMARY = 'HORUS'
+DATA_SOURCE_FALLBACK = 'COINGECKO'
+
+HORUS_REQUEST_TIMEOUT = 15
+HORUS_RETRY_LIMIT = 3
+HORUS_CACHE_DURATION = 60
+
+MIN_VOLUME_FILTER = 100000
+MIN_PRICE = 0.0001
 
 # Logging setup
 logging.basicConfig(
@@ -378,7 +427,7 @@ class TradingBot:
             'total_orders': 0,
             'successful_orders': 0,
             'failed_orders': 0,
-            'last_check': None
+            'last_check': 0.0
         }
     
     def initialize(self) -> bool:
@@ -530,4 +579,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
