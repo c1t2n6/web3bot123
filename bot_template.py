@@ -24,6 +24,8 @@ from collections import deque
 from enum import Enum
 import os
 from dotenv import load_dotenv
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 # Load environment variables from .env
 load_dotenv()
@@ -76,8 +78,24 @@ HORUS_REQUEST_TIMEOUT = 15
 HORUS_RETRY_LIMIT = 3
 HORUS_CACHE_DURATION = 60
 
-MIN_VOLUME_FILTER = 100000
-MIN_PRICE = 0.0001
+# New rate limit config: requests per minute (adjust to your Horus plan)
+HORUS_RATE_LIMIT_PER_MINUTE = int(os.getenv('HORUS_RATE_LIMIT_PER_MINUTE', '60'))
+HORUS_MIN_REQUEST_INTERVAL = 60.0 / max(1, HORUS_RATE_LIMIT_PER_MINUTE)
+HORUS_LAST_REQUEST_TS = 0.0
+
+# Configure a requests Session with retries for Horus
+HORUS_SESSION = requests.Session()
+retry_strategy = Retry(
+    total=HORUS_RETRY_LIMIT,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+HORUS_SESSION.mount("https://", adapter)
+HORUS_SESSION.mount("http://", adapter)
+# We'll keep per-request headers rather than a global Authorization here because
+# HORUS_API_KEY may be None in dry-run/testing. Individual functions will set headers.
 
 # Logging setup
 logging.basicConfig(
@@ -161,6 +179,19 @@ def get_ticker(pair: str) -> Optional[Dict]:
         return None
 
 
+# Throttle helper for Horus to avoid hitting rate limits
+def _horus_throttle():
+    global HORUS_LAST_REQUEST_TS
+    now = time.time()
+    elapsed = now - HORUS_LAST_REQUEST_TS
+    if elapsed < HORUS_MIN_REQUEST_INTERVAL:
+        to_sleep = HORUS_MIN_REQUEST_INTERVAL - elapsed
+        logger.debug(f"Throttling Horus requests: sleeping {to_sleep:.2f}s")
+        time.sleep(to_sleep)
+    HORUS_LAST_REQUEST_TS = time.time()
+
+
+# Replace get_ohlc_from_horus to use HORUS_SESSION and handle 429 Retry-After
 def get_ohlc_from_horus(pair: str, timeframe: str = '15m', limit: int = 50) -> Optional[list]:
     """Fetch historical OHLC candlestick data from Horus API
 
@@ -177,7 +208,7 @@ def get_ohlc_from_horus(pair: str, timeframe: str = '15m', limit: int = 50) -> O
     url = f"{HORUS_BASE_URL}/ohlc"
 
     headers = {
-        'Authorization': f'Bearer {HORUS_API_KEY}',
+        'Authorization': f'Bearer {HORUS_API_KEY}' if HORUS_API_KEY else '',
         'Content-Type': 'application/json'
     }
 
@@ -189,7 +220,20 @@ def get_ohlc_from_horus(pair: str, timeframe: str = '15m', limit: int = 50) -> O
 
     try:
         logger.debug(f"Fetching OHLC from Horus: {pair} {timeframe}")
-        response = requests.get(url, headers=headers, params=params, timeout=HORUS_REQUEST_TIMEOUT)
+        # Throttle to respect rate limits
+        _horus_throttle()
+        response = HORUS_SESSION.get(url, headers=headers, params=params, timeout=HORUS_REQUEST_TIMEOUT)
+        # If Horus returns 429 (Too Many Requests), respect Retry-After header
+        if response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            try:
+                wait = float(retry_after) if retry_after else HORUS_MIN_REQUEST_INTERVAL
+            except Exception:
+                wait = HORUS_MIN_REQUEST_INTERVAL
+            logger.warning(f"Horus rate limited for {pair} - sleeping {wait}s")
+            time.sleep(wait)
+            return None
+
         response.raise_for_status()
         data = response.json()
 
@@ -236,16 +280,29 @@ def get_ohlc_from_horus(pair: str, timeframe: str = '15m', limit: int = 50) -> O
         return None
 
 
+# Replace get_horus_available_pairs to use HORUS_SESSION and throttle
 def get_horus_available_pairs() -> Optional[list]:
     """Fetch list of available trading pairs from Horus"""
     url = f"{HORUS_BASE_URL}/pairs"
     headers = {
-        'Authorization': f'Bearer {HORUS_API_KEY}',
+        'Authorization': f'Bearer {HORUS_API_KEY}' if HORUS_API_KEY else '',
         'Content-Type': 'application/json'
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        # throttle
+        _horus_throttle()
+        response = HORUS_SESSION.get(url, headers=headers, timeout=HORUS_REQUEST_TIMEOUT)
+        if response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            try:
+                wait = float(retry_after) if retry_after else HORUS_MIN_REQUEST_INTERVAL
+            except Exception:
+                wait = HORUS_MIN_REQUEST_INTERVAL
+            logger.warning(f"Horus rate limited when fetching pairs - sleeping {wait}s")
+            time.sleep(wait)
+            return None
+
         response.raise_for_status()
         data = response.json()
         pairs = data.get('data', data.get('pairs', []))
@@ -1379,7 +1436,15 @@ def main():
     logger.info("ROOSTOO AI TRADING BOT - CRAIG PERCOCO STRATEGY")
     logger.info("="*60 + "\n")
 
-    initial_capital = 10000.0
+    # Starting portfolio capital (default $50,000) - can be overridden with INITIAL_CAPITAL env var
+    try:
+        initial_capital = float(os.getenv('INITIAL_CAPITAL', '50000.0'))
+    except Exception:
+        initial_capital = 50000.0
+
+    # Explicit startup log for initial capital
+    logger.info(f"Starting portfolio capital: ${initial_capital:,.2f}")
+
     portfolio_manager = PortfolioManager(initial_capital)
     strategy = MultiAssetPercocolStrategy(portfolio_manager)
     bot = MultiAssetTradingBot(strategy, portfolio_manager)
